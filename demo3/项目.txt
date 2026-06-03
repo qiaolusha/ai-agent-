@@ -1,0 +1,500 @@
+目标：一个可运行的 RAG 服务 + 引用来源 + RAGAS 离线评估脚本。
+项目结构
+text
+demo4/
+├── docker-compose.yml        # pgvector 容器
+├── requirements.txt
+├── config.py                 # 统一配置
+├── ingest.py                 # 文档解析 + 入库
+├── query.py                  # 检索 + 回答 + 引用
+├── app.py                    # FastAPI 服务
+├── evaluate.py               # RAGAS 离线评估脚本
+├── data/
+│   ├── sample.pdf
+│   └── sample.md
+└── eval/
+    ├── qa_samples.json       # 20条测试样本
+    └── report.csv            # 评估输出
+________________________________________
+docker-compose.yml
+YAML
+version: "3.9"
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: raguser
+      POSTGRES_PASSWORD: ragpass
+      POSTGRES_DB: ragdb
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+volumes:
+  pgdata:
+Bash
+docker compose up -d
+________________________________________
+requirements.txt
+txt
+llama-index>=0.10.0
+llama-index-vector-stores-postgres
+llama-index-embeddings-openai
+llama-index-llms-openai
+llama-index-postprocessor-cohere-rerank
+pymupdf4llm
+psycopg2-binary
+sqlalchemy
+fastapi
+uvicorn
+python-multipart
+ragas>=0.2.0
+pandas
+datasets
+python-dotenv
+________________________________________
+config.py
+Python
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# LLM & Embedding
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+EMBED_MODEL = "text-embedding-3-small"
+LLM_MODEL = "gpt-4o-mini"
+
+# Chunking — 关键取舍参数，集中管理
+CHUNK_SIZE = 512        # token 数。太小→碎片化丢上下文；太大→噪音多
+CHUNK_OVERLAP = 50      # 相邻 chunk 重叠。防止边界语义断裂
+
+# Retrieval
+TOP_K = 5               # 检索数量。4~6 是经验平衡点
+
+# pgvector
+DB_URL = "postgresql+psycopg2://raguser:ragpass@localhost:5432/ragdb"
+________________________________________
+ingest.py — 文档解析 + Chunk + Embedding + 入库
+Python
+"""
+文档摄入管道：PDF / Markdown / 纯文本 → pgvector
+"""
+import pymupdf4llm
+from pathlib import Path
+from llama_index.core import Document, VectorStoreIndex, StorageContext, Settings
+from llama_index.core.node_parser import SentenceSplitter
+from llama_index.embeddings.openai import OpenAIEmbedding
+from llama_index.llms.openai import OpenAI
+from llama_index.vector_stores.postgres import PGVectorStore
+import sqlalchemy
+from config import *
+
+
+# ── 1. 全局 Settings ───────────────────────────────────────────────────────────
+Settings.embed_model = OpenAIEmbedding(
+    model=EMBED_MODEL, api_key=OPENAI_API_KEY
+)
+Settings.llm = OpenAI(model=LLM_MODEL, api_key=OPENAI_API_KEY)
+
+
+# ── 2. 初始化 pgvector ─────────────────────────────────────────────────────────
+def get_vector_store(table_name: str = "rag_docs") -> PGVectorStore:
+    engine = sqlalchemy.create_engine(DB_URL)
+    # 确保 vector 扩展存在
+    with engine.connect() as conn:
+        conn.execute(sqlalchemy.text("CREATE EXTENSION IF NOT EXISTS vector"))
+        conn.commit()
+
+    return PGVectorStore.from_params(
+        database="ragdb",
+        host="localhost",
+        password="ragpass",
+        port=5432,
+        user="raguser",
+        table_name=table_name,
+        embed_dim=1536,    # text-embedding-3-small 的维度
+    )
+
+
+# ── 3. 文档解析 ────────────────────────────────────────────────────────────────
+def load_document(file_path: str) -> list[Document]:
+    """
+    支持 PDF / Markdown / txt
+    返回带 metadata 的 Document 列表
+    """
+    path = Path(file_path)
+    file_name = path.name
+
+    if path.suffix.lower() == ".pdf":
+        # pymupdf4llm: 输出带页码的 Markdown，保留结构
+        md_text = pymupdf4llm.to_markdown(str(path), page_chunks=True)
+        docs = []
+        for i, page in enumerate(md_text):
+            docs.append(Document(
+                text=page["text"],
+                metadata={
+                    "file_name": file_name,
+                    "page_label": str(page.get("page", i + 1)),
+                    "source": str(path),
+                }
+            ))
+        return docs
+
+    elif path.suffix.lower() in [".md", ".txt"]:
+        text = path.read_text(encoding="utf-8")
+        return [Document(
+            text=text,
+            metadata={"file_name": file_name, "page_label": "1", "source": str(path)}
+        )]
+
+    else:
+        raise ValueError(f"不支持的文件类型: {path.suffix}")
+
+
+# ── 4. 主入库函数 ──────────────────────────────────────────────────────────────
+def ingest(file_path: str) -> int:
+    """
+    完整 pipeline: 解析 → chunk → embed → 存入 pgvector
+    返回写入的 node 数量
+    """
+    # 4.1 解析
+    documents = load_document(file_path)
+    print(f"[ingest] 解析完成，共 {len(documents)} 页/段落")
+
+    # 4.2 Chunking
+    # SentenceSplitter: 尊重句子边界，不会在句中截断
+    # chunk_size=512 是经验起点：太小→碎片化；太大→噪音多、LLM 上下文压力大
+    # chunk_overlap=50 防止边界处语义丢失
+    splitter = SentenceSplitter(
+        chunk_size=CHUNK_SIZE,
+        chunk_overlap=CHUNK_OVERLAP
+    )
+
+    # 4.3 建索引（内部自动 embed + 写入向量库）
+    vector_store = get_vector_store()
+    storage_context = StorageContext.from_defaults(vector_store=vector_store)
+
+    index = VectorStoreIndex.from_documents(
+        documents,
+        storage_context=storage_context,
+        transformations=[splitter],
+        show_progress=True,
+    )
+
+    print(f"[ingest] 写入完成，文件: {file_path}")
+    return len(documents)
+
+
+if __name__ == "__main__":
+    import sys
+    ingest(sys.argv[1])
+________________________________________
+query.py — 检索 + 回答 + 引用来源
+Python
+"""
+RAG 查询模块：检索 → 生成回答 → 返回带引用的结构化结果
+"""
+from llama_index.core import VectorStoreIndex, StorageContext, Settings
+from llama_index.core.response.schema import Response
+from llama_index.embeddings.openai import OpenAIEmbedding
+from llama_index.llms.openai import OpenAI
+from llama_index.vector_stores.postgres import PGVectorStore
+from config import *
+
+Settings.embed_model = OpenAIEmbedding(model=EMBED_MODEL, api_key=OPENAI_API_KEY)
+Settings.llm = OpenAI(model=LLM_MODEL, api_key=OPENAI_API_KEY)
+
+
+def get_index() -> VectorStoreIndex:
+    vector_store = PGVectorStore.from_params(
+        database="ragdb", host="localhost",
+        password="ragpass", port=5432, user="raguser",
+        table_name="rag_docs", embed_dim=1536,
+    )
+    storage_context = StorageContext.from_defaults(vector_store=vector_store)
+    return VectorStoreIndex.from_vector_store(
+        vector_store, storage_context=storage_context
+    )
+
+
+def parse_citations(response: Response) -> list[dict]:
+    """
+    从 source_nodes 中提取引用信息
+    每条引用包含: chunk_id / file_name / page / score / 文本片段
+    """
+    citations = []
+    for node in response.source_nodes:
+        meta = node.node.metadata
+        citations.append({
+            "chunk_id":  node.node.node_id,
+            "file_name": meta.get("file_name", "unknown"),
+            "page":      meta.get("page_label", "?"),
+            "score":     round(node.score or 0.0, 4),
+            "snippet":   node.node.text[:200] + "..."  # 显示前200字符
+        })
+    return citations
+
+
+def rag_query(question: str) -> dict:
+    """
+    主查询函数，返回:
+    {
+        "answer": str,
+        "citations": [{"chunk_id", "file_name", "page", "score", "snippet"}],
+        "contexts": [str]  # 供 RAGAS 评估使用
+    }
+    """
+    index = get_index()
+
+    # TOP_K=5: 检索5个最相关的 chunk
+    # 取舍: 太小→漏关键信息；太大→LLM上下文过长成本高
+    query_engine = index.as_query_engine(
+        similarity_top_k=TOP_K,
+        # 可选：开启 rerank（需要 Cohere API key）
+        # node_postprocessors=[CohereRerank(api_key=COHERE_KEY, top_n=3)]
+    )
+
+    response = query_engine.query(question)
+    citations = parse_citations(response)
+    contexts = [node.node.text for node in response.source_nodes]
+
+    return {
+        "answer": str(response),
+        "citations": citations,
+        "contexts": contexts,
+    }
+
+
+if __name__ == "__main__":
+    q = "文档的主要内容是什么？"
+    result = rag_query(q)
+    print(f"\n回答：{result['answer']}\n")
+    print("引用来源：")
+    for c in result["citations"]:
+        print(f"  [{c['file_name']} p.{c['page']}] score={c['score']}  chunk_id={c['chunk_id'][:8]}...")
+        print(f"  片段: {c['snippet']}\n")
+________________________________________
+app.py — FastAPI 服务
+Python
+"""
+RAG HTTP 服务
+POST /upload  — 上传文档并入库
+POST /query   — 提问并获取带引用的回答
+"""
+import shutil, tempfile
+from pathlib import Path
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from pydantic import BaseModel
+from ingest import ingest
+from query import rag_query
+
+app = FastAPI(title="RAG 文档问答服务")
+
+ALLOWED_EXTENSIONS = {".pdf", ".md", ".txt"}
+
+
+class QueryRequest(BaseModel):
+    question: str
+
+
+class Citation(BaseModel):
+    chunk_id: str
+    file_name: str
+    page: str
+    score: float
+    snippet: str
+
+
+class QueryResponse(BaseModel):
+    answer: str
+    citations: list[Citation]
+
+
+@app.post("/upload")
+async def upload_document(file: UploadFile = File(...)):
+    """上传 PDF / Markdown / txt，解析并入向量库"""
+    suffix = Path(file.filename).suffix.lower()
+    if suffix not in ALLOWED_EXTENSIONS:
+        raise HTTPException(400, f"不支持的文件类型: {suffix}，支持: {ALLOWED_EXTENSIONS}")
+
+    # 保存到临时文件
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        shutil.copyfileobj(file.file, tmp)
+        tmp_path = tmp.name
+
+    try:
+        count = ingest(tmp_path)
+        return {"status": "ok", "file": file.filename, "chunks_ingested": count}
+    except Exception as e:
+        raise HTTPException(500, str(e))
+    finally:
+        Path(tmp_path).unlink(missing_ok=True)
+
+
+@app.post("/query", response_model=QueryResponse)
+async def query_document(req: QueryRequest):
+    """提问，返回回答 + 引用来源"""
+    if not req.question.strip():
+        raise HTTPException(400, "问题不能为空")
+    result = rag_query(req.question)
+    return QueryResponse(
+        answer=result["answer"],
+        citations=[Citation(**c) for c in result["citations"]]
+    )
+
+
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
+Bash
+uvicorn app:app --reload --port 8000
+________________________________________
+evaluate.py — RAGAS 离线评估脚本（核心工程产出物）
+Python
+"""
+离线 RAG 评估脚本
+输入: eval/qa_samples.json (20条 QA 样本)
+输出: eval/report.csv + 控制台打印汇总指标
+
+RAGAS 四大指标:
+  - faithfulness:     回答是否完全基于检索到的 context（衡量幻觉）
+  - answer_relevancy: 回答是否真正回答了问题
+  - context_precision: 检索到的 context 有多少是有用的
+  - context_recall:   有多少 ground_truth 信息被检索到
+"""
+import json
+import pandas as pd
+from datasets import Dataset
+from ragas import evaluate
+from ragas.metrics import (
+    faithfulness,
+    answer_relevancy,
+    context_precision,
+    context_recall,
+)
+from query import rag_query
+
+
+def load_qa_samples(path: str = "eval/qa_samples.json") -> list[dict]:
+    """
+    样本格式:
+    [
+      {
+        "question": "XXX 是什么？",
+        "ground_truth": "标准参考答案..."
+      },
+      ...
+    ]
+    """
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def collect_rag_outputs(samples: list[dict]) -> list[dict]:
+    """对每个问题跑 RAG，收集回答和检索到的 contexts"""
+    results = []
+    for i, sample in enumerate(samples):
+        print(f"[{i+1}/{len(samples)}] 正在处理: {sample['question'][:50]}...")
+        try:
+            output = rag_query(sample["question"])
+            results.append({
+                "question":     sample["question"],
+                "answer":       output["answer"],
+                "contexts":     output["contexts"],     # list[str]
+                "ground_truth": sample["ground_truth"],
+            })
+        except Exception as e:
+            print(f"  ⚠️ 跳过，错误: {e}")
+    return results
+
+
+def run_evaluation(output_path: str = "eval/report.csv"):
+    """主评估函数"""
+    # 1. 加载样本
+    samples = load_qa_samples()
+    print(f"[evaluate] 加载 {len(samples)} 条 QA 样本")
+
+    # 2. 跑 RAG 收集输出
+    rag_outputs = collect_rag_outputs(samples)
+    print(f"[evaluate] RAG 推理完成，有效样本: {len(rag_outputs)} 条")
+
+    # 3. 构建 RAGAS Dataset
+    dataset = Dataset.from_list(rag_outputs)
+
+    # 4. 运行评估（RAGAS 用 LLM 作为评估 judge）
+    print("[evaluate] 开始 RAGAS 评估...")
+    result = evaluate(
+        dataset=dataset,
+        metrics=[
+            faithfulness,        # 忠实度：有无幻觉
+            answer_relevancy,    # 答案相关性
+            context_precision,   # 检索精度
+            context_recall,      # 检索召回
+        ],
+    )
+
+    # 5. 输出结果
+    df = result.to_pandas()
+
+    # 汇总指标
+    print("\n" + "="*50)
+    print("📊 RAGAS 评估报告汇总")
+    print("="*50)
+    summary_cols = ["faithfulness", "answer_relevancy", "context_precision", "context_recall"]
+    for col in summary_cols:
+        if col in df.columns:
+            print(f"  {col:25s}: {df[col].mean():.4f}")
+    print("="*50)
+
+    # 保存 CSV
+    import os
+    os.makedirs("eval", exist_ok=True)
+    df.to_csv(output_path, index=False, encoding="utf-8-sig")
+    print(f"\n✅ 详细报告已保存至: {output_path}")
+
+    return df
+
+
+if __name__ == "__main__":
+    run_evaluation()
+________________________________________
+eval/qa_samples.json — 样本格式示例
+JSON
+[
+  {
+    "question": "文档中提到的主要技术方案是什么？",
+    "ground_truth": "文档中提到的主要技术方案是XXX..."
+  },
+  {
+    "question": "该系统的性能指标是多少？",
+    "ground_truth": "系统的性能指标为..."
+  }
+]
+💡 20条样本怎么来：上传你自己的文档后，人工从文档中抽取真实问答对即可，ground_truth 直接从原文复制。
+________________________________________
+🚀 第二天运行顺序
+Bash
+# 1. 启动数据库
+docker compose up -d
+
+# 2. 安装依赖
+pip install -r requirements.txt
+
+# 3. 设置环境变量
+export OPENAI_API_KEY=sk-xxx
+
+# 4. 上传文档入库（直接跑脚本）
+python ingest.py data/sample.pdf
+
+# 5. 测试查询
+python query.py
+
+# 6. 启动 API 服务
+uvicorn app:app --reload
+
+# 7. 跑 RAGAS 离线评估（最后的工程产出）
+python evaluate.py
+# → 输出 eval/report.csv
+

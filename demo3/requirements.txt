@@ -1,0 +1,15 @@
+llama-index>=0.10.0
+llama-index-vector-stores-postgres
+llama-index-embeddings-openai
+llama-index-llms-openai
+llama-index-postprocessor-cohere-rerank
+pymupdf4llm
+psycopg2-binary
+sqlalchemy
+fastapi
+uvicorn
+python-multipart
+ragas>=0.2.0
+pandas
+datasets
+python-dotenv
